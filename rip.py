@@ -44,7 +44,6 @@ DEFAULT_CONFIG = {
         "audio_codec": "aac",
         "audio_bitrate": "128",
         "audio_language": "eng",  # primary audio language
-        "subtitle_language": "eng",  # primary subtitle language (or "all")
         "quality": 22,  # 0=lossless, 28=low quality; 22 is good balance
         "use_gpu": True,  # Enable NVIDIA NVENC if available
         "gpu_device": 0,  # GPU device ID (0 for first GPU)
