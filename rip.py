@@ -430,8 +430,11 @@ def detect_nvidia_gpu(logger: logging.Logger) -> bool:
 
 def get_available_handbrake_encoders(logger: logging.Logger) -> Dict[str, bool]:
     """
-    Check which video encoders are available in HandBrake.
+    Check which video encoders are available in HandBrake by parsing --help output.
+    Parses the 'Select video encode' section to find available encoders.
     Returns dict of encoder_name -> available (bool).
+
+    Encoder names used: nvenc_h265, nvenc_h264, x265, x264
     """
     try:
         result = subprocess.run(
@@ -441,22 +444,45 @@ def get_available_handbrake_encoders(logger: logging.Logger) -> Dict[str, bool]:
             timeout=10,
         )
         output = result.stdout + result.stderr
-        
+
+        # Parse the encoder list from --help output
+        # Look for lines after "Select video encode" or "-e, --encoder"
+        available_encoders = set()
+        in_encoder_section = False
+
+        for line in output.split('\n'):
+            if 'Select video encode' in line or '-e, --encoder' in line:
+                in_encoder_section = True
+                continue
+            if in_encoder_section:
+                # End of encoder list (next option or empty line after entries)
+                line_stripped = line.strip()
+                if line_stripped.startswith('-') or not line_stripped:
+                    if line_stripped.startswith('-'):
+                        break
+                    continue
+                # Encoder names are indented (e.g., "   nvenc_h265")
+                if line.startswith('   ') and line_stripped:
+                    available_encoders.add(line_stripped)
+
+        logger.debug(f"Found encoders: {available_encoders}")
+
+        # Map to our encoder categories (using actual HandBrakeCLI names)
         encoders = {
-            'hevc_nvenc': 'hevc_nvenc' in output,
-            'h264_nvenc': 'h264_nvenc' in output,
-            'hevc': 'hevc' in output,
-            'h264': 'h264' in output,
+            'nvenc_h265': 'nvenc_h265' in available_encoders,
+            'nvenc_h264': 'nvenc_h264' in available_encoders,
+            'x265': 'x265' in available_encoders,
+            'x264': 'x264' in available_encoders,
         }
-        
+
         for enc, available in encoders.items():
-            if available:
-                logger.debug(f"HandBrake encoder available: {enc}")
-        
+            status = "available" if available else "unavailable"
+            logger.debug(f"HandBrake encoder {enc}: {status}")
+
         return encoders
     except Exception as e:
         logger.warning(f"Could not detect available encoders: {e}")
-        return {'hevc': True, 'h264': True}  # Fallback to CPU encoders
+        return {'x265': True, 'x264': True}  # Fallback to CPU encoders
 
 
 def encode_with_handbrake(
@@ -497,24 +523,28 @@ def encode_with_handbrake(
             "-f", handbrake_config["format"],
         ]
         
-        # Video codec: use GPU-accelerated variant if available
+        # Video codec: default to nvenc_h265 if available, otherwise fall back through options
         selected_encoder = None
-        if use_gpu and gpu_available and encoders.get('hevc_nvenc'):
-            # NVIDIA NVENC HEVC encoder
-            selected_encoder = "hevc_nvenc"
-            logger.info("✓ Using NVIDIA NVENC HEVC encoder")
-        elif use_gpu and gpu_available and encoders.get('h264_nvenc'):
-            # Fallback to H.264 NVENC if HEVC not available
-            selected_encoder = "h264_nvenc"
-            logger.info("⚠ HEVC NVENC not available; using H.264 NVENC")
-        elif encoders.get('hevc'):
-            # CPU HEVC
-            selected_encoder = "hevc"
-            logger.info("Using CPU HEVC encoder")
+        if encoders.get('nvenc_h265'):
+            # NVIDIA NVENC H.265 (HEVC) encoder - preferred default
+            selected_encoder = "nvenc_h265"
+            logger.info("✓ Using NVIDIA NVENC H.265 encoder")
+        elif encoders.get('nvenc_h264'):
+            # NVIDIA NVENC H.264 encoder
+            selected_encoder = "nvenc_h264"
+            logger.info("⚠ nvenc_h265 not available; using NVIDIA NVENC H.264 encoder")
+        elif encoders.get('x265'):
+            # CPU H.265 (HEVC) encoder
+            selected_encoder = "x265"
+            logger.info("⚠ No NVENC available; using CPU H.265 encoder")
+        elif encoders.get('x264'):
+            # CPU H.264 encoder
+            selected_encoder = "x264"
+            logger.info("⚠ Using CPU H.264 encoder")
         else:
-            # Fallback to H.264
-            selected_encoder = "h264"
-            logger.info("Using CPU H.264 encoder")
+            # Ultimate fallback
+            selected_encoder = "x264"
+            logger.warning("⚠ No encoders detected; defaulting to x264")
         
         cmd.extend(["-e", selected_encoder])
         
@@ -527,12 +557,19 @@ def encode_with_handbrake(
         else:
             cmd.extend(["-q", str(handbrake_config["quality"])])
         
-        # Audio and subtitles
+        # Audio: include ALL audio tracks from source
+        # --all-audio: include every audio track found
+        # -E: audio encoder for all tracks
+        # -B: bitrate for all tracks
         cmd.extend([
-            "-B", handbrake_config["audio_bitrate"],
-            "-a", handbrake_config["audio_language"],
-            "-s", handbrake_config["subtitle_language"],
+            "--all-audio",
+            "-E", handbrake_config["audio_codec"],  # Audio encoder (aac)
+            "-B", handbrake_config["audio_bitrate"],  # Audio bitrate
         ])
+
+        # Subtitles: include all subtitle tracks
+        if handbrake_config.get("subtitle_language"):
+            cmd.extend(["--all-subtitles", "-s", handbrake_config["subtitle_language"]])
         
         logger.debug(f"Running: {' '.join(cmd)}")
         
