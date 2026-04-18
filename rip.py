@@ -567,9 +567,9 @@ def encode_with_handbrake(
             "-B", handbrake_config["audio_bitrate"],  # Audio bitrate
         ])
 
-        # Subtitles: include all subtitle tracks
-        if handbrake_config.get("subtitle_language"):
-            cmd.extend(["--all-subtitles", "-s", handbrake_config["subtitle_language"]])
+        # Subtitles: include all subtitle tracks from source
+        # --all-subtitles includes every subtitle track; don't combine with -s
+        cmd.append("--all-subtitles")
         
         logger.debug(f"Running: {' '.join(cmd)}")
         
