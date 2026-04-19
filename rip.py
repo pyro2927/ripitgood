@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
 
     # Output directory structure (Plex-compatible)
     "output_root": os.path.expanduser("~/Media/Plex/Movies"),
+    "output_root_tv_shows": os.path.expanduser("~/Media/Plex/TV Shows"),
 
     # Temporary scratch space (where MakeMKV outputs MKVs before encoding)
     "scratch_dir": os.path.expanduser("~/tmp/bluray_scratch"),
@@ -55,6 +56,13 @@ DEFAULT_CONFIG = {
     "makemkv": {
         "use_largest_title": True,  # Auto-select longest title (usually the feature)
         "min_duration_seconds": 600,  # Skip titles shorter than 10 minutes
+    },
+
+    # TV Show detection settings
+    "tv_shows": {
+        "auto_detect": True,  # Auto-detect TV show vs movie from disk metadata
+        "min_title_duration_minutes": 10,  # Minimum title duration for consideration
+        "seasonal_output": True,  # Organize TV shows by season
     },
 
     # Logging
@@ -210,23 +218,27 @@ def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]
                 pass
 
 
-def get_makemkv_title_list(device: str, min_duration: int = 600) -> List[TitleInfo]:
+def get_makemkv_title_list(device: str, min_duration: int = 600, logger: Optional[logging.Logger] = None) -> List[TitleInfo]:
     """
-    Get list of titles from MakeMKV rip operation.
+    Get list of titles from MakeMKV info command.
     Parses makemkvcon output for title names and durations.
 
     Returns list of TitleInfo objects sorted by duration (longest first).
     """
+    import logging as logging_module
+    if logger is None:
+        logger = logging_module.getLogger(__name__)
+
     titles: List[TitleInfo] = []
 
     try:
-        # Run makemkvcon in listing mode to get title info
+        # Run makemkvcon in info mode to get title info
+        # --messages=stdout sends messages to stdout for parsing
         cmd = [
             "makemkvcon",
-            "--minlength=" + str(min_duration),
-            "list",  # Listing mode - just show titles without ripping
-            "dev:" + device,
-            "0",
+            "--messages=stdout",
+            "info",
+            "disc:" + device,
         ]
 
         process = subprocess.Popen(
@@ -239,29 +251,38 @@ def get_makemkv_title_list(device: str, min_duration: int = 600) -> List[TitleIn
 
         output = process.communicate(timeout=60)[0]
 
-        # Parse makemkvcon listing output for titles and durations
+        # Parse makemkvcon info output
+        # Format: TCINFO,<track>,<duration_secs>,<type>,"<title>","<description>"
+        # Example: TCINFO,1,7200,0,"Main Feature","Movie"
+        # Also: MSGINFO lines contain metadata
         for line in output.split('\n'):
-            # Format: "   123456789 (3h 15m) Episode Title"
-            # or: "001011121 (30m) Movie Title - Alternate Title"
-            match = re.search(r'\((\d+) m\)\s+(.+)', line)
-            if match:
-                duration_mins = int(match.group(1))
-                name = match.group(2).strip()
+            if line.startswith('TCINFO,'):
+                parts = line.split(',')
+                if len(parts) >= 5:
+                    try:
+                        # parts[1] = track number
+                        # parts[2] = duration in seconds
+                        duration_secs = int(parts[2])
+                        duration_mins = duration_secs / 60.0
 
-                # Remove episode numbers from title (e.g., "S01E03" or "#1")
-                clean_name = re.sub(r'[Ss]\d+[Ee]\d+|#\d+', '', name)
-                clean_name = re.sub(r'\([^)]+\)', '', clean_name)  # Remove extra parentheses
-
-                if clean_name and len(clean_name.strip()) > 2:
-                    titles.append(TitleInfo(name=clean_name, duration_minutes=duration_mins))
+                        if duration_secs >= min_duration:
+                            # Extract title from quoted string (may contain commas)
+                            title_match = re.search(r',"([^"]+)"', line)
+                            if title_match:
+                                name = title_match.group(1).strip()
+                                if name and len(name) > 2:
+                                    titles.append(TitleInfo(name=name, duration_minutes=duration_mins))
+                    except (ValueError, IndexError) as e:
+                        logger.debug(f"Failed to parse line: {line} - {e}")
+                        continue
 
         if titles:
-            logger.info(f"Found {len(titles)} titles from MakeMKV listing")
+            logger.info(f"Found {len(titles)} titles from MakeMKV info")
 
         return sorted(titles, key=lambda t: t.duration_minutes, reverse=True)
 
     except subprocess.TimeoutExpired:
-        logger.error("MakeMKV listing timed out")
+        logger.error("MakeMKV info timed out")
         return titles
     except Exception as e:
         logger.error(f"Error getting title list: {e}")
@@ -1049,7 +1070,7 @@ EXAMPLES:
     logger.info("\n[4/5] Detecting content type and encoding...")
 
     # Get title list from the rip to detect content type
-    titles = get_makemkv_title_list(args.device, config["makemkv"]["min_duration_seconds"])
+    titles = get_makemkv_title_list(args.device, config["makemkv"]["min_duration_seconds"], logger)
 
     # Detect if this is a TV show or movie
     is_tv_show, tv_title_name = detect_tv_show_vs_movie(titles, logger)
