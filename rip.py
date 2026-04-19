@@ -929,6 +929,19 @@ def prompt_for_title() -> str:
 
 
 def main():
+    # Load configuration FIRST so we can use config file values as argparse defaults
+    # First, check if --config was passed on command line (need to parse just this arg)
+    config_path = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--config" and i + 1 < len(sys.argv):
+            config_path = sys.argv[i + 1]
+            break
+        elif arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+
+    config = load_config(config_path)
+
     parser = argparse.ArgumentParser(
         description="BluRay Ripper - MakeMKV + HandBrake pipeline with Plex organization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -948,36 +961,36 @@ EXAMPLES:
 
         """,
     )
-    
+
     parser.add_argument(
         "--config",
         help="Path to config YAML file (default: config/defaults.yaml or defaults.yaml)",
     )
     parser.add_argument(
         "--device",
-        default=DEFAULT_CONFIG["device"],
-        help=f"BluRay device path (default: {DEFAULT_CONFIG['device']})",
+        default=config["device"],
+        help=f"BluRay device path (default: {config['device']})",
     )
     parser.add_argument(
         "--output",
-        default=DEFAULT_CONFIG["output_root"],
+        default=config["output_root"],
         dest="output_root",
-        help=f"Output root directory (default: {DEFAULT_CONFIG['output_root']})",
+        help=f"Output root directory (default: {config['output_root']})",
     )
     parser.add_argument(
         "--scratch",
-        default=DEFAULT_CONFIG["scratch_dir"],
+        default=config["scratch_dir"],
         dest="scratch_dir",
-        help=f"Scratch directory for MKV temp files (default: {DEFAULT_CONFIG['scratch_dir']})",
+        help=f"Scratch directory for MKV temp files (default: {config['scratch_dir']})",
     )
     parser.add_argument(
         "--preset",
-        default=DEFAULT_CONFIG["handbrake"]["preset"],
-        help=f"HandBrake preset (default: {DEFAULT_CONFIG['handbrake']['preset']})",
+        default=config["handbrake"]["preset"],
+        help=f"HandBrake preset (default: {config['handbrake']['preset']})",
     )
     parser.add_argument(
         "--log-level",
-        default=DEFAULT_CONFIG["log_level"],
+        default=config["log_level"],
         help="Log level (DEBUG, INFO, WARNING, ERROR)",
     )
     parser.add_argument(
@@ -990,12 +1003,8 @@ EXAMPLES:
         action="store_true",
         help="Disable GPU acceleration (force CPU encoding)",
     )
-    
-    args = parser.parse_args()
 
-    # Load configuration (merged from defaults.yaml and CLI arguments)
-    config_path = args.config if args.config else None
-    config = load_config(config_path)
+    args = parser.parse_args()
 
     # Apply CLI overrides to loaded config
     if args.no_gpu:
