@@ -7,7 +7,7 @@ device: /dev/sr0
 # Output directory structure (Plex-compatible)
 # Movies: ~/Media/Plex/Movies/Title (Year)/
 # TV Shows: ~/Media/Plex/TV Shows/ShowName/Season 1/
-output_root_movies: ~/Media/Plex/Movies
+output_root: ~/Media/Plex/Movies
 output_root_tv_shows: ~/Media/Plex/TV Shows
 
 # Temporary scratch space for MakeMKV temp files

@@ -82,14 +82,26 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             import yaml
             with open(config_path, 'r') as f:
                 loaded_config = yaml.safe_load(f) or {}
+                logging.info(f"Loaded raw YAML keys: {list(loaded_config.keys())}")
+
                 # Merge loaded config with defaults (loaded takes precedence)
                 merged_config = {**DEFAULT_CONFIG}
                 for key, value in loaded_config.items():
                     if isinstance(value, dict) and key in DEFAULT_CONFIG and isinstance(DEFAULT_CONFIG[key], dict):
                         merged_config[key] = {**DEFAULT_CONFIG[key], **value}
+                        logging.debug(f"  Merging nested dict for [{key}]")
                     else:
                         merged_config[key] = value
-                return merged_config
+                        logging.debug(f"  Set [{key}] = {value}")
+
+            # Add debug logging to show what was loaded (using module-level logging)
+            for key, value in merged_config.items():
+                if key == "handbrake":
+                    continue  # Skip nested dicts, log at end
+                logging.debug(f"Final config [{key}]: {value}")
+            logging.info(f"Configuration loaded from: {config_path}")
+            return merged_config
+
         except ImportError:
             logging.warning("PyYAML not installed; using default configuration")
         except Exception as e:
@@ -917,6 +929,10 @@ EXAMPLES:
     )
     
     parser.add_argument(
+        "--config",
+        help="Path to config YAML file (default: config/defaults.yaml or defaults.yaml)",
+    )
+    parser.add_argument(
         "--device",
         default=DEFAULT_CONFIG["device"],
         help=f"BluRay device path (default: {DEFAULT_CONFIG['device']})",
@@ -955,13 +971,17 @@ EXAMPLES:
     )
     
     args = parser.parse_args()
-    
-    # Apply CLI overrides
+
+    # Load configuration (merged from defaults.yaml and CLI arguments)
+    config_path = args.config if args.config else None
+    config = load_config(config_path)
+
+    # Apply CLI overrides to loaded config
     if args.no_gpu:
-        DEFAULT_CONFIG["handbrake"]["use_gpu"] = False
-    
+        config["handbrake"]["use_gpu"] = False
+
     # Setup
-    logger = setup_logging(args.log_level, DEFAULT_CONFIG["log_file"])
+    logger = setup_logging(args.log_level, config["log_file"])
     logger.info("=" * 80)
     logger.info("BluRay Ripper Started")
     logger.info(f"Device: {args.device}")
@@ -969,7 +989,7 @@ EXAMPLES:
     logger.info(f"Scratch: {args.scratch_dir}")
     
     # Check GPU capability
-    if DEFAULT_CONFIG["handbrake"].get("use_gpu"):
+    if config["handbrake"].get("use_gpu"):
         logger.info("\n[GPU Acceleration]")
         if detect_nvidia_gpu(logger):
             logger.info("✓ NVIDIA GPU available; will use NVENC for encoding")
@@ -997,7 +1017,7 @@ EXAMPLES:
         title = prompt_for_title()
     
     # Look up metadata on OMDb
-    media_info = fetch_omdb_data(title, DEFAULT_CONFIG["omdb_api_key"], logger)
+    media_info = fetch_omdb_data(title, config["omdb_api_key"], logger)
     if media_info:
         logger.info(f"✓ Found: {media_info.plex_folder_name()}")
         logger.info(f"  Rating: {media_info.rating}, Plot: {media_info.plot[:100]}...")
@@ -1016,8 +1036,8 @@ EXAMPLES:
     mkv_path = rip_with_makemkv(
         args.device,
         args.scratch_dir,
-        DEFAULT_CONFIG["makemkv"]["use_largest_title"],
-        DEFAULT_CONFIG["makemkv"]["min_duration_seconds"],
+        config["makemkv"]["use_largest_title"],
+        config["makemkv"]["min_duration_seconds"],
         logger,
     )
     if not mkv_path:
@@ -1029,7 +1049,7 @@ EXAMPLES:
     logger.info("\n[4/5] Detecting content type and encoding...")
 
     # Get title list from the rip to detect content type
-    titles = get_makemkv_title_list(args.device, DEFAULT_CONFIG["makemkv"]["min_duration_seconds"])
+    titles = get_makemkv_title_list(args.device, config["makemkv"]["min_duration_seconds"])
 
     # Detect if this is a TV show or movie
     is_tv_show, tv_title_name = detect_tv_show_vs_movie(titles, logger)
@@ -1038,14 +1058,14 @@ EXAMPLES:
         logger.info(f"✓ Detected as TV show: {tv_title_name}")
 
         # Determine output path for TV shows (Plex structure)
-        tv_root = DEFAULT_CONFIG.get("output_root_tv_shows", os.path.expanduser(DEFAULT_CONFIG["output_root"]))
+        tv_root = config.get("output_root_tv_shows", os.path.expanduser(config["output_root"]))
 
         # For TV shows, use a simple structure without year
         output_path = Path(tv_root) / f"{tv_title_name}.tv"
 
         logger.info(f"  Output (TV): {output_path}")
 
-        if not encode_with_handbrake(mkv_path, output_path, DEFAULT_CONFIG["handbrake"], logger):
+        if not encode_with_handbrake(mkv_path, output_path, config["handbrake"], logger):
             logger.error("HandBrake encoding failed")
             sys.exit(1)
     else:
@@ -1055,7 +1075,7 @@ EXAMPLES:
 
         logger.info(f"  Output (Movie): {output_path}")
 
-        if not encode_with_handbrake(mkv_path, output_path, DEFAULT_CONFIG["handbrake"], logger):
+        if not encode_with_handbrake(mkv_path, output_path, config["handbrake"], logger):
             logger.error("HandBrake encoding failed")
             sys.exit(1)
     logger.info(f"✓ Encoding complete: {output_path}")
