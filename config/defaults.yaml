@@ -1,0 +1,45 @@
+# Rip It Good - Default Configuration
+# Place this file next to rip.py or in config/ directory
+# Values are strongly opinionated defaults; override with --config flag if needed
+
+device: /dev/sr0
+
+# Output directory structure (Plex-compatible)
+# Movies: ~/Media/Plex/Movies/Title (Year)/
+# TV Shows: ~/Media/Plex/TV Shows/ShowName/Season 1/
+output_root_movies: ~/Media/Plex/Movies
+output_root_tv_shows: ~/Media/Plex/TV Shows
+
+# Temporary scratch space for MakeMKV temp files
+scratch_dir: ~/tmp/bluray_scratch
+
+# OMDb API key (set via OMDB_API_KEY env var)
+# Get free key from https://www.omdbapi.com/apikey.aspx
+omdb_api_key: ""
+
+# HandBrake defaults (strongly opinionated for modern streaming)
+handbrake:
+  preset: "Fast 1080p30"     # Options: "Universal", "Fast 720p30", "Super HQ 1080p30"
+  format: "mkv"
+  video_codec: "hevc"        # h.265 for better compression
+  audio_codec: "aac"
+  audio_bitrate: "128"
+  audio_language: "eng"      # Primary audio language
+  quality: 22                # 0=lossless, 28=low quality; 22 is good balance
+  use_gpu: true              # Enable NVIDIA NVENC if available
+  gpu_device: 0             # GPU device ID (0 for first GPU)
+
+# MakeMKV defaults
+makemkv:
+  use_largest_title: true    # Auto-select longest title (usually the feature)
+  min_duration_seconds: 600  # Skip titles shorter than 10 minutes
+
+# Logging
+log_level: "INFO"
+log_file: ~/logs/bluray_ripper.log
+
+# TV Show Detection (auto-detection thresholds)
+tv_shows:
+  auto_detect: true          # Auto-detect TV show vs movie from disk metadata
+  min_title_duration_minutes: 10   # Minimum title duration for consideration
+  seasonal_output: true      # Organize TV shows by season

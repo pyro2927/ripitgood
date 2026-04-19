@@ -2,6 +2,7 @@
 """
 BluRay Ripper - Strongly opinionated media extraction pipeline.
 Detects BluRay disks, rips with MakeMKV, encodes with HandBrake, and organizes into Plex-compatible structure.
+Supports both movies and TV shows with auto-detection.
 
 Requirements:
   pip install requests pyyaml
@@ -10,32 +11,33 @@ Requirements:
 
 import os
 import sys
-import json
 import subprocess
 import argparse
 import logging
 from pathlib import Path
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
 import requests
+import re
 
 # ============================================================================
 # CONFIG: STRONGLY OPINIONATED DEFAULTS
 # ============================================================================
 
+# Default configuration for movies (maintain backward compatibility)
 DEFAULT_CONFIG = {
     # BluRay device (override with --device)
     "device": "/dev/sr0",
-    
-    # Output directory structure
+
+    # Output directory structure (Plex-compatible)
     "output_root": os.path.expanduser("~/Media/Plex/Movies"),
-    
+
     # Temporary scratch space (where MakeMKV outputs MKVs before encoding)
     "scratch_dir": os.path.expanduser("~/tmp/bluray_scratch"),
-    
+
     # OMDb API key (get from https://www.omdbapi.com/apikey.aspx)
     "omdb_api_key": os.environ.get("OMDB_API_KEY", ""),
-    
+
     # HandBrake defaults (strongly opinionated for modern streaming)
     "handbrake": {
         "preset": "Fast 1080p30",  # or: "Universal", "Fast 720p30", "Super HQ 1080p30"
@@ -48,17 +50,269 @@ DEFAULT_CONFIG = {
         "use_gpu": True,  # Enable NVIDIA NVENC if available
         "gpu_device": 0,  # GPU device ID (0 for first GPU)
     },
-    
+
     # MakeMKV defaults
     "makemkv": {
         "use_largest_title": True,  # Auto-select longest title (usually the feature)
         "min_duration_seconds": 600,  # Skip titles shorter than 10 minutes
     },
-    
+
     # Logging
     "log_level": "INFO",
     "log_file": os.path.expanduser("~/logs/bluray_ripper.log"),
 }
+
+
+def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Load configuration from YAML file or use defaults.
+    Falls back to DEFAULT_CONFIG if no config file found.
+    """
+    if config_path is None:
+        # Look for config file next to this script
+        script_dir = Path(__file__).parent.resolve()
+        config_paths = [
+            script_dir / "config" / "defaults.yaml",
+            script_dir / "defaults.yaml",
+        ]
+        config_path = next((p for p in config_paths if p.exists()), None)
+
+    if config_path and Path(config_path).exists():
+        try:
+            import yaml
+            with open(config_path, 'r') as f:
+                loaded_config = yaml.safe_load(f) or {}
+                # Merge loaded config with defaults (loaded takes precedence)
+                merged_config = {**DEFAULT_CONFIG}
+                for key, value in loaded_config.items():
+                    if isinstance(value, dict) and key in DEFAULT_CONFIG and isinstance(DEFAULT_CONFIG[key], dict):
+                        merged_config[key] = {**DEFAULT_CONFIG[key], **value}
+                    else:
+                        merged_config[key] = value
+                return merged_config
+        except ImportError:
+            logging.warning("PyYAML not installed; using default configuration")
+        except Exception as e:
+            logging.debug(f"Config file load error, using defaults: {e}")
+
+    return DEFAULT_CONFIG.copy()
+
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
+@dataclass
+class MediaInfo:
+    """Metadata from OMDb."""
+    title: str
+    year: int
+    imdb_id: str
+    plot: str
+    rating: str
+
+    def plex_folder_name(self) -> str:
+        """Return Plex-compatible folder name: 'Title (Year)'"""
+        return f"{self.title} ({self.year})"
+
+
+@dataclass
+class TitleInfo:
+    """Information about a detected title on the disk."""
+    name: str
+    duration_minutes: float
+
+
+# ============================================================================
+# TV SHOW DETECTION & PLEX FOLDER STRUCTURE
+# ============================================================================
+
+def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]:
+    """
+    Scan BluRay disk for all titles and return their durations.
+    Uses bdmt_eng.xml metadata if available, otherwise parses makemkv output.
+
+    Returns list of TitleInfo objects sorted by duration (longest first).
+    """
+    import xml.etree.ElementTree as ET
+
+    mount_point = None
+    we_mounted = False
+    titles: List[TitleInfo] = []
+
+    try:
+        # Check if device is already mounted
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "TARGET", device],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if result.returncode == 0:
+            mount_point = result.stdout.strip()
+            we_mounted = False
+            logger.debug(f"Using existing mount point: {mount_point}")
+        else:
+            mount_point = "/mnt/bluray_detect"
+            if not mount_device(device, mount_point, logger):
+                return titles
+            we_mounted = True
+
+        # Try to read metadata XML for title info
+        xml_file = Path(mount_point) / "BDMV" / "META" / "DL" / "bdmt_eng.xml"
+
+        if xml_file.exists():
+            try:
+                tree = ET.parse(xml_file)
+                root = tree.getroot()
+
+                ns = {'di': 'urn:BDA:bdmv;discinfo'}
+
+                # Get all title/episodenames and their durations
+                for title_elem in root.findall(".//di:title/di:name", ns):
+                    if title_elem.text:
+                        titles.append(TitleInfo(name=title_elem.text.strip(), duration_minutes=0))
+
+                logger.info(f"Found {len(titles)} titles from metadata")
+            except ET.ParseError as e:
+                logger.debug(f"Failed to parse XML: {e}")
+        else:
+            logger.debug(f"No bdmt_eng.xml found at {xml_file}")
+
+        return titles
+
+    except Exception as e:
+        logger.error(f"Error scanning disk for titles: {e}")
+        return titles
+    finally:
+        if we_mounted and mount_point:
+            try:
+                subprocess.run(
+                    ["sudo", "umount", mount_point],
+                    capture_output=True,
+                    timeout=5,
+                )
+                logger.debug(f"Unmounted {mount_point}")
+            except Exception:
+                pass
+
+
+def get_makemkv_title_list(device: str, min_duration: int = 600) -> List[TitleInfo]:
+    """
+    Get list of titles from MakeMKV rip operation.
+    Parses makemkvcon output for title names and durations.
+
+    Returns list of TitleInfo objects sorted by duration (longest first).
+    """
+    titles: List[TitleInfo] = []
+
+    try:
+        # Run makemkvcon in listing mode to get title info
+        cmd = [
+            "makemkvcon",
+            "--minlength=" + str(min_duration),
+            "list",  # Listing mode - just show titles without ripping
+            "dev:" + device,
+            "0",
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+        )
+
+        output = process.communicate(timeout=60)[0]
+
+        # Parse makemkvcon listing output for titles and durations
+        for line in output.split('\n'):
+            # Format: "   123456789 (3h 15m) Episode Title"
+            # or: "001011121 (30m) Movie Title - Alternate Title"
+            match = re.search(r'\((\d+) m\)\s+(.+)', line)
+            if match:
+                duration_mins = int(match.group(1))
+                name = match.group(2).strip()
+
+                # Remove episode numbers from title (e.g., "S01E03" or "#1")
+                clean_name = re.sub(r'[Ss]\d+[Ee]\d+|#\d+', '', name)
+                clean_name = re.sub(r'\([^)]+\)', '', clean_name)  # Remove extra parentheses
+
+                if clean_name and len(clean_name.strip()) > 2:
+                    titles.append(TitleInfo(name=clean_name, duration_minutes=duration_mins))
+
+        if titles:
+            logger.info(f"Found {len(titles)} titles from MakeMKV listing")
+
+        return sorted(titles, key=lambda t: t.duration_minutes, reverse=True)
+
+    except subprocess.TimeoutExpired:
+        logger.error("MakeMKV listing timed out")
+        return titles
+    except Exception as e:
+        logger.error(f"Error getting title list: {e}")
+        return titles
+
+
+def detect_tv_show_vs_movie(titles: List[TitleInfo], logger: logging.Logger) -> Tuple[bool, str]:
+    """
+    Auto-detect if the content is a TV show or movie.
+
+    Detection logic:
+    - If 3+ titles are over 10 minutes each, it's likely a TV show
+    - If exactly 1 dominant title (longest > 80% of total), it's a movie
+
+    Returns (is_tv_show, display_name)
+    """
+    if not titles:
+        logger.debug("No titles found; cannot detect type")
+        return False, ""
+
+    # Filter to meaningful content only
+    meaningful_titles = [t for t in titles if t.duration_minutes >= 10]
+
+    if len(meaningful_titles) < 2:
+        logger.debug(f"Only {len(meaningful_titles)} meaningful titles; treating as movie")
+        return False, ""
+
+    # Sort by duration (longest first)
+    meaningful_titles = sorted(meaningful_titles, key=lambda t: t.duration_minutes, reverse=True)
+
+    total_duration = sum(t.duration_minutes for t in meaningful_titles)
+    longest_title = meaningful_titles[0]
+    longest_ratio = longest_title.duration_minutes / total_duration if total_duration > 0 else 0
+
+    logger.debug(f"Longest title: {longest_title.name} ({longest_title.duration_minutes}m, {longest_ratio*100:.1f}% of total)")
+
+    # TV Show criteria: 3+ titles over 10 minutes each
+    if len(meaningful_titles) >= 3:
+        logger.info(f"Detected TV show: {len(meaningful_titles)} episodes/seasons found")
+
+        # Try to determine if these are episode numbers or season info from title
+        first_title = meaningful_titles[0]
+        display_name = first_title.name
+
+        # Check if titles contain season indicators in the metadata
+        is_multi_season = any("season" in t.name.lower() for t in meaningful_titles)
+
+        return True, display_name
+
+    # Movie criteria: 1 dominant title (very long relative to others)
+    elif longest_ratio > 0.7:
+        logger.info(f"Detected movie: single dominant title ({longest_ratio*100:.1f}% of content)")
+        return False, meaningful_titles[0].name
+
+    # Edge case: multiple comparable titles (could be compilation or special)
+    else:
+        logger.warning(f"Multiple similar-length titles detected; using first one")
+        return False, meaningful_titles[0].name
+
+
+# ============================================================================
+# MAKEMKV INTEGRATION
+# ============================================================================
 
 # ============================================================================
 # SETUP
@@ -96,20 +350,6 @@ def setup_logging(log_level: str, log_file: str) -> logging.Logger:
 # MEDIA DETECTION & OMDB
 # ============================================================================
 
-@dataclass
-class MediaInfo:
-    """Metadata from OMDb."""
-    title: str
-    year: int
-    imdb_id: str
-    plot: str
-    rating: str
-    
-    def plex_folder_name(self) -> str:
-        """Return Plex-compatible folder name: 'Title (Year)'"""
-        return f"{self.title} ({self.year})"
-
-
 def fetch_omdb_data(title: str, omdb_key: str, logger: logging.Logger) -> Optional[MediaInfo]:
     """
     Query OMDb to get movie metadata.
@@ -144,7 +384,7 @@ def fetch_omdb_data(title: str, omdb_key: str, logger: logging.Logger) -> Option
 
 
 # ============================================================================
-# BLURAY TITLE EXTRACTION
+# SETUP
 # ============================================================================
 
 def mount_device(device: str, mount_point: str, logger: logging.Logger) -> bool:
@@ -662,13 +902,17 @@ def main():
         epilog="""
 EXAMPLES:
   # Rip from default device (/dev/sr0) to default Plex location
-  python bluray_ripper.py
+  python rip.py
 
   # Rip from specific device and output location
-  python bluray_ripper.py --device /dev/dvd --output ~/MyMovies
+  python rip.py --device /dev/dvd --output ~/MyMovies
 
   # Dry-run to test device detection and metadata
-  python bluray_ripper.py --dry-run
+  python rip.py --dry-run
+
+  # Rip a TV show (auto-detects from disk content)
+  python rip.py --output ~/Media/Plex/TV Shows
+
         """,
     )
     
@@ -780,19 +1024,40 @@ EXAMPLES:
         logger.error("MakeMKV rip failed")
         sys.exit(1)
     logger.info(f"✓ MKV ready: {mkv_path}")
-    
-    # Step 4: Encode with HandBrake
-    logger.info("\n[4/5] Encoding with HandBrake...")
-    
-    # Determine output path in Plex structure
-    folder_name = media_info.plex_folder_name()
-    output_path = Path(args.output_root) / folder_name / f"{folder_name}.mkv"
-    
-    logger.info(f"  Output: {output_path}")
-    
-    if not encode_with_handbrake(mkv_path, output_path, DEFAULT_CONFIG["handbrake"], logger):
-        logger.error("HandBrake encoding failed")
-        sys.exit(1)
+
+    # Step 4: Auto-detect TV show vs movie and encode with HandBrake
+    logger.info("\n[4/5] Detecting content type and encoding...")
+
+    # Get title list from the rip to detect content type
+    titles = get_makemkv_title_list(args.device, DEFAULT_CONFIG["makemkv"]["min_duration_seconds"])
+
+    # Detect if this is a TV show or movie
+    is_tv_show, tv_title_name = detect_tv_show_vs_movie(titles, logger)
+
+    if is_tv_show:
+        logger.info(f"✓ Detected as TV show: {tv_title_name}")
+
+        # Determine output path for TV shows (Plex structure)
+        tv_root = DEFAULT_CONFIG.get("output_root_tv_shows", os.path.expanduser(DEFAULT_CONFIG["output_root"]))
+
+        # For TV shows, use a simple structure without year
+        output_path = Path(tv_root) / f"{tv_title_name}.tv"
+
+        logger.info(f"  Output (TV): {output_path}")
+
+        if not encode_with_handbrake(mkv_path, output_path, DEFAULT_CONFIG["handbrake"], logger):
+            logger.error("HandBrake encoding failed")
+            sys.exit(1)
+    else:
+        # Movie handling (original logic)
+        folder_name = media_info.plex_folder_name() if media_info else "Unknown Title"
+        output_path = Path(args.output_root) / folder_name / f"{folder_name}.mkv"
+
+        logger.info(f"  Output (Movie): {output_path}")
+
+        if not encode_with_handbrake(mkv_path, output_path, DEFAULT_CONFIG["handbrake"], logger):
+            logger.error("HandBrake encoding failed")
+            sys.exit(1)
     logger.info(f"✓ Encoding complete: {output_path}")
     
     # Step 5: Cleanup
