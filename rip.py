@@ -33,8 +33,8 @@ DEFAULT_CONFIG = {
     "output_root": os.path.expanduser("~/Media/Plex/Movies"),
     "output_root_tv_shows": os.path.expanduser("~/Media/Plex/TV Shows"),
 
-    # Temporary scratch space (where MakeMKV outputs MKVs before encoding)
-    "scratch_dir": os.path.expanduser("~/tmp/bluray_scratch"),
+    # Temporary scratch space (relative to script location by default)
+    "scratch_dir": Path(__file__).parent / "tmp" / "bluray_scratch",
 
     # OMDb API key (get from https://www.omdbapi.com/apikey.aspx)
     "omdb_api_key": os.environ.get("OMDB_API_KEY", ""),
@@ -79,6 +79,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     if config_path is None:
         # Look for config file next to this script
         script_dir = Path(__file__).parent.resolve()
+        print(script_dir)
         config_paths = [
             script_dir / "config" / "defaults.yaml",
             script_dir / "defaults.yaml",
@@ -90,30 +91,25 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             import yaml
             with open(config_path, 'r') as f:
                 loaded_config = yaml.safe_load(f) or {}
-                logging.info(f"Loaded raw YAML keys: {list(loaded_config.keys())}")
 
                 # Merge loaded config with defaults (loaded takes precedence)
                 merged_config = {**DEFAULT_CONFIG}
                 for key, value in loaded_config.items():
                     if isinstance(value, dict) and key in DEFAULT_CONFIG and isinstance(DEFAULT_CONFIG[key], dict):
                         merged_config[key] = {**DEFAULT_CONFIG[key], **value}
-                        logging.debug(f"  Merging nested dict for [{key}]")
                     else:
                         merged_config[key] = value
-                        logging.debug(f"  Set [{key}] = {value}")
 
             # Add debug logging to show what was loaded (using module-level logging)
             for key, value in merged_config.items():
                 if key == "handbrake":
-                    continue  # Skip nested dicts, log at end
-                logging.debug(f"Final config [{key}]: {value}")
-            logging.info(f"Configuration loaded from: {config_path}")
+                    continue  # Skip nested dicts
             return merged_config
 
         except ImportError:
-            logging.warning("PyYAML not installed; using default configuration")
-        except Exception as e:
-            logging.debug(f"Config file load error, using defaults: {e}")
+            pass  # Use defaults
+        except Exception:
+            pass  # Use defaults
 
     return DEFAULT_CONFIG.copy()
 
@@ -141,6 +137,7 @@ class TitleInfo:
     """Information about a detected title on the disk."""
     name: str
     duration_minutes: float
+    title_id: int = 0
 
 
 # ============================================================================
@@ -172,7 +169,6 @@ def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]
         if result.returncode == 0:
             mount_point = result.stdout.strip()
             we_mounted = False
-            logger.debug(f"Using existing mount point: {mount_point}")
         else:
             mount_point = "/mnt/bluray_detect"
             if not mount_device(device, mount_point, logger):
@@ -194,11 +190,10 @@ def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]
                     if title_elem.text:
                         titles.append(TitleInfo(name=title_elem.text.strip(), duration_minutes=0))
 
-                logger.info(f"Found {len(titles)} titles from metadata")
-            except ET.ParseError as e:
-                logger.debug(f"Failed to parse XML: {e}")
-        else:
-            logger.debug(f"No bdmt_eng.xml found at {xml_file}")
+                if titles:
+                    logger.info(f"Found {len(titles)} titles from metadata")
+            except ET.ParseError:
+                pass
 
         return titles
 
@@ -213,7 +208,6 @@ def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]
                     capture_output=True,
                     timeout=5,
                 )
-                logger.debug(f"Unmounted {mount_point}")
             except Exception:
                 pass
 
@@ -221,7 +215,15 @@ def scan_disk_for_titles(device: str, logger: logging.Logger) -> List[TitleInfo]
 def get_makemkv_title_list(device: str, min_duration: int = 600, logger: Optional[logging.Logger] = None) -> List[TitleInfo]:
     """
     Get list of titles from MakeMKV info command.
-    Parses makemkvcon output for title names and durations.
+    Parses makemkvcon output for title IDs.
+
+    Output format:
+    - File 00705.mpls was added as title #0 (title passes duration filter)
+    - Title #xxx.mpls has length of X seconds... (skipped due to --minlength)
+
+    Since MakeMKV doesn't report durations for passed titles, we extract all
+    "added as title" entries and use placeholder durations. The actual episode
+    metadata comes from parsing the title names later.
 
     Returns list of TitleInfo objects sorted by duration (longest first).
     """
@@ -233,12 +235,13 @@ def get_makemkv_title_list(device: str, min_duration: int = 600, logger: Optiona
 
     try:
         # Run makemkvcon in info mode to get title info
-        # --messages=stdout sends messages to stdout for parsing
+        # Note: --messages=stdout doesn't work with subprocess, so we use default output
+        # Use minlength=0 (very fast) for initial scan, then filter based on duration if needed
         cmd = [
             "makemkvcon",
-            "--messages=stdout",
+            "--minlength=0",  # Include all titles to avoid timeout issues
             "info",
-            "disc:" + device,
+            "dev:" + device,
         ]
 
         process = subprocess.Popen(
@@ -246,101 +249,173 @@ def get_makemkv_title_list(device: str, min_duration: int = 600, logger: Optiona
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=60,
         )
 
-        output = process.communicate(timeout=60)[0]
+        try:
+            output, _ = process.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            logger.error("MakeMKV info timed out")
+            return titles
 
-        # Parse makemkvcon info output
-        # Format: TCINFO,<track>,<duration_secs>,<type>,"<title>","<description>"
-        # Example: TCINFO,1,7200,0,"Main Feature","Movie"
-        # Also: MSGINFO lines contain metadata
+        # Parse makemkvcon info output for title additions
+        # Format: "File xxx.mpls was added as title #N"
+        current_skipped_duration = None
+
         for line in output.split('\n'):
-            if line.startswith('TCINFO,'):
-                parts = line.split(',')
-                if len(parts) >= 5:
-                    try:
-                        # parts[1] = track number
-                        # parts[2] = duration in seconds
-                        duration_secs = int(parts[2])
-                        duration_mins = duration_secs / 60.0
+            # Track duration from skipped titles (these have length info)
+            skipped_match = re.search(r'Title\s+#\d+\.mpls has length of (\d+) seconds', line)
+            if skipped_match:
+                current_skipped_duration = int(skipped_match.group(1))
 
-                        if duration_secs >= min_duration:
-                            # Extract title from quoted string (may contain commas)
-                            title_match = re.search(r',"([^"]+)"', line)
-                            if title_match:
-                                name = title_match.group(1).strip()
-                                if name and len(name) > 2:
-                                    titles.append(TitleInfo(name=name, duration_minutes=duration_mins))
-                    except (ValueError, IndexError) as e:
-                        logger.debug(f"Failed to parse line: {line} - {e}")
-                        continue
+            # Check for "File xxx.mpls was added as title #N" pattern
+            title_add_match = re.search(r'File\s+\S+\.mpls\s+was\s+added\s+as\s+title\s+#(\d+)', line)
+            if title_add_match:
+                title_id = int(title_add_match.group(1))
+                # Use the last seen skipped duration, or fallback to min_duration + buffer
+                duration_seconds = current_skipped_duration if current_skipped_duration is not None else 600
+                # Clear the skipped duration since we've used it
+                current_skipped_duration = None
 
+                # Filter titles by minimum duration if specified (min_duration > 0)
+                if min_duration <= 0 or duration_seconds >= min_duration:
+                    titles.append(TitleInfo(
+                        name=f"Episode {title_id}",  # Placeholder, will be parsed later from actual title names
+                        duration_minutes=duration_seconds / 60.0,
+                        title_id=title_id
+                    ))
+
+        # Sort by duration (longest first)
         if titles:
+            titles = sorted(titles, key=lambda t: t.duration_minutes, reverse=True)
             logger.info(f"Found {len(titles)} titles from MakeMKV info")
 
-        return sorted(titles, key=lambda t: t.duration_minutes, reverse=True)
-
-    except subprocess.TimeoutExpired:
-        logger.error("MakeMKV info timed out")
         return titles
+
     except Exception as e:
         logger.error(f"Error getting title list: {e}")
         return titles
 
 
-def detect_tv_show_vs_movie(titles: List[TitleInfo], logger: logging.Logger) -> Tuple[bool, str]:
+def count_video_files_on_disk(device: str, logger: logging.Logger) -> int:
+    """
+    Count the number of M2TS video files on the BluRay disk.
+    TV shows typically have many small video files, movies have fewer/larger ones.
+
+    Returns count of .m2ts files in BDMV/STREAM directory.
+    """
+    mount_point = None
+    we_mounted = False
+
+    try:
+        # Check if device is already mounted
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "TARGET", device],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        if result.returncode == 0:
+            mount_point = result.stdout.strip()
+            we_mounted = False
+        else:
+            mount_point = "/mnt/bluray_count"
+            if not mount_device(device, mount_point, logger):
+                return -1  # Error
+            we_mounted = True
+
+        stream_dir = Path(mount_point) / "BDMV" / "STREAM"
+
+        if not stream_dir.exists():
+            return 0
+
+        m2ts_files = list(stream_dir.glob("*.m2ts"))
+        count = len(m2ts_files)
+
+        # Log sizes to help distinguish TV vs movie
+        if m2ts_files:
+            total_size = sum(f.stat().st_size for f in m2ts_files)
+
+        return count
+
+    except Exception as e:
+        logger.error(f"Error counting video files: {e}")
+        return -1
+    finally:
+        if we_mounted and mount_point:
+            try:
+                subprocess.run(
+                    ["sudo", "umount", mount_point],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+
+def detect_tv_show_vs_movie(titles: List[TitleInfo], title_name: str, year: int, video_count: int, logger: logging.Logger) -> Tuple[bool, str]:
     """
     Auto-detect if the content is a TV show or movie.
 
     Detection logic:
+    - Video file count > 5 strongly suggests TV show
     - If 3+ titles are over 10 minutes each, it's likely a TV show
     - If exactly 1 dominant title (longest > 80% of total), it's a movie
+    - Title name containing "Season" or having year > 2020 with short titles suggests TV
 
     Returns (is_tv_show, display_name)
     """
+    # TV Show criteria 0: Many video files (>5) - strong indicator of TV show
+    if video_count > 5:
+        logger.info(f"Detected TV show: {video_count} video files found on disk")
+        display_name = re.sub(r'\s*[Ss]eason\s*\d+', '', title_name).strip()
+        return True, display_name
+
+    # TV Show criteria 1: Title contains "Season"
+    if "season" in title_name.lower():
+        logger.info(f"Detected TV show: title contains 'season'")
+        return True, re.sub(r'\s*[Ss]eason\s*\d+', '', title_name).strip()
+
     if not titles:
-        logger.debug("No titles found; cannot detect type")
         return False, ""
 
     # Filter to meaningful content only
     meaningful_titles = [t for t in titles if t.duration_minutes >= 10]
 
-    if len(meaningful_titles) < 2:
-        logger.debug(f"Only {len(meaningful_titles)} meaningful titles; treating as movie")
-        return False, ""
-
     # Sort by duration (longest first)
     meaningful_titles = sorted(meaningful_titles, key=lambda t: t.duration_minutes, reverse=True)
 
-    total_duration = sum(t.duration_minutes for t in meaningful_titles)
-    longest_title = meaningful_titles[0]
+    total_duration = sum(t.duration_minutes for t in meaningful_titles) if meaningful_titles else 0
+    longest_title = meaningful_titles[0] if meaningful_titles else None
     longest_ratio = longest_title.duration_minutes / total_duration if total_duration > 0 else 0
 
-    logger.debug(f"Longest title: {longest_title.name} ({longest_title.duration_minutes}m, {longest_ratio*100:.1f}% of total)")
-
-    # TV Show criteria: 3+ titles over 10 minutes each
+    # TV Show criteria 2: Multiple episodes (3+ titles over 10 min each)
     if len(meaningful_titles) >= 3:
         logger.info(f"Detected TV show: {len(meaningful_titles)} episodes/seasons found")
-
-        # Try to determine if these are episode numbers or season info from title
         first_title = meaningful_titles[0]
-        display_name = first_title.name
-
-        # Check if titles contain season indicators in the metadata
-        is_multi_season = any("season" in t.name.lower() for t in meaningful_titles)
-
+        display_name = re.sub(r'\s*[Ee]pisode\s*\d+', '', first_title.name).strip()
         return True, display_name
 
+    # TV Show criteria 3: Recent release (2020+) with short episode-like titles
+    if year >= 2020 and len(meaningful_titles) > 1:
+        # Check if any titles look like episodes
+        has_episode_pattern = any(re.search(r'[Ee]pisode\s*\d+|[Cc]hapter\s*\d+', t.name) for t in meaningful_titles)
+        if has_episode_pattern or all(t.duration_minutes < 60 for t in meaningful_titles):
+            logger.info(f"Detected TV show: recent release with episode-like content")
+            first_title = meaningful_titles[0]
+            display_name = re.sub(r'\s*[Ee]pisode\s*\d+', '', first_title.name).strip()
+            return True, display_name
+
     # Movie criteria: 1 dominant title (very long relative to others)
-    elif longest_ratio > 0.7:
+    if longest_ratio > 0.7:
         logger.info(f"Detected movie: single dominant title ({longest_ratio*100:.1f}% of content)")
-        return False, meaningful_titles[0].name
+        return False, longest_title.name if longest_title else title_name
 
     # Edge case: multiple comparable titles (could be compilation or special)
-    else:
-        logger.warning(f"Multiple similar-length titles detected; using first one")
-        return False, meaningful_titles[0].name
+    logger.warning(f"Multiple similar-length titles detected; using first one")
+    return False, meaningful_titles[0].name if meaningful_titles else title_name
 
 
 # ============================================================================
@@ -354,28 +429,28 @@ def detect_tv_show_vs_movie(titles: List[TitleInfo], logger: logging.Logger) -> 
 def setup_logging(log_level: str, log_file: str) -> logging.Logger:
     """Configure logging to file and stdout."""
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    
+
     logger = logging.getLogger("bluray_ripper")
     logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # File handler
+
+    # File handler - writes all levels for debugging
     fh = logging.FileHandler(log_file)
-    fh.setLevel(getattr(logging, log_level.upper()))
-    
-    # Console handler
+    fh.setLevel(logging.DEBUG)
+
+    # Console handler - cleaner output by default
     ch = logging.StreamHandler()
-    ch.setLevel(getattr(logging, log_level.upper()))
-    
+    ch.setLevel(logging.INFO)  # Only show INFO+ on console
+
     # Formatter
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
     fh.setFormatter(formatter)
     ch.setFormatter(formatter)
-    
+
     logger.addHandler(fh)
     logger.addHandler(ch)
-    
+
     return logger
 
 
@@ -383,27 +458,39 @@ def setup_logging(log_level: str, log_file: str) -> logging.Logger:
 # MEDIA DETECTION & OMDB
 # ============================================================================
 
-def fetch_omdb_data(title: str, omdb_key: str, logger: logging.Logger) -> Optional[MediaInfo]:
+def fetch_omdb_data(title: str, omdb_key: str, logger: logging.Logger, media_type: str = "movie", year: int = 0) -> Optional[MediaInfo]:
     """
-    Query OMDb to get movie metadata.
+    Query OMDb to get movie or TV show metadata.
+    OMDb API uses type=series for TV shows, not type=tv.
     Returns MediaInfo or None if not found.
+
+    If year is provided, it will be used to filter results for better accuracy.
     """
     if not omdb_key:
         logger.warning("OMDB_API_KEY not set; skipping metadata lookup")
         return None
-    
+
+    # OMDb uses "series" for TV shows, not "tv"
+    omdb_type = media_type
+    if media_type == "tv":
+        omdb_type = "series"
+
     url = "https://www.omdbapi.com/"
-    params = {"apikey": omdb_key, "t": title, "type": "movie"}
-    
+    params = {"apikey": omdb_key, "t": title, "type": omdb_type}
+
+    # Add year parameter for more accurate matching (e.g., "Knuckles 2023" vs older)
+    if year > 0:
+        params["y"] = str(year)
+
     try:
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        
+
         if data.get("Response") == "False":
             logger.warning(f"OMDb: {data.get('Error', 'Unknown error')}")
             return None
-        
+
         return MediaInfo(
             title=data.get("Title", title),
             year=int(data.get("Year", 0) or 0),
@@ -414,6 +501,17 @@ def fetch_omdb_data(title: str, omdb_key: str, logger: logging.Logger) -> Option
     except Exception as e:
         logger.error(f"OMDb lookup failed: {e}")
         return None
+
+
+def fetch_omdb_data_for_tv(title: str, omdb_key: str, logger: logging.Logger, year: int = 0) -> Optional[MediaInfo]:
+    """
+    Query OMDb to get TV show metadata.
+    OMDb API uses type=series for TV shows, not type=tv.
+    Returns MediaInfo or None if not found.
+
+    If year is provided, it will be used to filter results for better accuracy.
+    """
+    return fetch_omdb_data(title, omdb_key, logger, media_type="series", year=year)
 
 
 # ============================================================================
@@ -431,9 +529,8 @@ def mount_device(device: str, mount_point: str, logger: logging.Logger) -> bool:
             timeout=5,
         )
         if result.returncode == 0:
-            logger.debug(f"Device already mounted at {result.stdout.strip()}")
             return True
-        
+
         # Mount device
         Path(mount_point).mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
@@ -444,10 +541,8 @@ def mount_device(device: str, mount_point: str, logger: logging.Logger) -> bool:
         )
         
         if result.returncode == 0:
-            logger.debug(f"Mounted {device} at {mount_point}")
             return True
         else:
-            logger.warning(f"Failed to mount {device}: {result.stderr}")
             return False
     except Exception as e:
         logger.error(f"Mount error: {e}")
@@ -474,47 +569,35 @@ def extract_bluray_title_from_disk(device: str, logger: logging.Logger) -> Optio
         )
         
         if result.returncode == 0:
-            # Device is already mounted, use that mount point
             mount_point = result.stdout.strip()
             we_mounted = False
-            logger.debug(f"Using existing mount point: {mount_point}")
         else:
             # Device not mounted, mount it ourselves
             mount_point = "/mnt/bluray_detect"
             if not mount_device(device, mount_point, logger):
-                logger.debug("Could not mount device to read metadata")
                 return None
             we_mounted = True
         
         # Try to find and parse the metadata XML file
         xml_file = Path(mount_point) / "BDMV" / "META" / "DL" / "bdmt_eng.xml"
-        logger.debug(f"Looking for metadata at: {xml_file}")
-        
+
         if not xml_file.exists():
-            logger.debug(f"No metadata file at {xml_file}")
             # Try other language variants
             meta_dir = Path(mount_point) / "BDMV" / "META" / "DL"
-            logger.debug(f"Checking if META/DL dir exists: {meta_dir}")
             if meta_dir.exists():
                 xml_files = list(meta_dir.glob("bdmt_*.xml"))
-                logger.debug(f"Found {len(xml_files)} metadata files: {[f.name for f in xml_files]}")
                 if xml_files:
                     xml_file = xml_files[0]
-                    logger.debug(f"Using alternate metadata: {xml_file.name}")
                 else:
-                    logger.debug("No bdmt_*.xml files found in META/DL")
                     return None
             else:
-                logger.debug(f"META/DL directory does not exist at {meta_dir}")
-                # List what's actually in the mount point
+                # List what's actually in the mount point for debugging
                 try:
                     bdmv_dir = Path(mount_point) / "BDMV"
-                    if bdmv_dir.exists():
-                        logger.debug(f"Contents of {bdmv_dir}: {list(bdmv_dir.iterdir())}")
-                    else:
-                        logger.debug(f"BDMV directory does not exist at {bdmv_dir}")
-                except Exception as e:
-                    logger.debug(f"Error listing directory: {e}")
+                    if not bdmv_dir.exists():
+                        return None
+                except Exception:
+                    return None
                 return None
         
         # Parse XML to extract title
@@ -533,11 +616,7 @@ def extract_bluray_title_from_disk(device: str, logger: logging.Logger) -> Optio
         title_elem = root.find(".//di:title/di:name", ns)
         
         if title_elem is not None and title_elem.text:
-            title = title_elem.text.strip()
-            logger.info(f"✓ Extracted title from disk: {title}")
-            return title
-        
-        logger.debug("No title found in XML metadata")
+            return title_elem.text.strip()
         return None
         
     except ET.ParseError as e:
@@ -555,7 +634,6 @@ def extract_bluray_title_from_disk(device: str, logger: logging.Logger) -> Optio
                     capture_output=True,
                     timeout=5,
                 )
-                logger.debug(f"Unmounted {mount_point}")
             except Exception:
                 pass
 
@@ -577,12 +655,8 @@ def detect_bluray_disk(device: str, logger: logging.Logger) -> bool:
         
         # findmnt returns 0 if device exists and is mounted
         if result.returncode == 0:
-            # Check if output contains the device path
-            output = result.stdout.strip()
-            if output and device in output:
-                logger.debug(f"Device found: {output}")
-                return True
-        
+            return True
+
         # Fallback: check if device file exists and is readable
         # This works for unmounted optical media
         device_path = Path(device)
@@ -591,12 +665,11 @@ def detect_bluray_disk(device: str, logger: logging.Logger) -> bool:
             try:
                 with open(device, 'rb') as f:
                     f.read(1)
-                logger.debug(f"Device accessible: {device}")
                 return True
             except (IOError, OSError):
-                logger.debug(f"Device not readable: {device}")
-                return False
-        
+                pass
+            return False
+
         return False
     except Exception as e:
         logger.error(f"Failed to detect disk: {e}")
@@ -614,11 +687,12 @@ def rip_with_makemkv(
     Rip BluRay to MKV using makemkvcon.
     Shows real-time progress output.
     Returns path to the output MKV, or None if failed.
+    Uses title_id=0 to rip all titles.
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
+
     logger.info(f"Starting MakeMKV rip from {device} to {output_dir}")
-    
+
     try:
         # makemkvcon dev:<device> <title_id> <output_dir>
         cmd = [
@@ -629,9 +703,7 @@ def rip_with_makemkv(
             "0",
             output_dir,
         ]
-        
-        logger.debug(f"Running: {' '.join(cmd)}")
-        
+
         # Run with real-time output streaming
         process = subprocess.Popen(
             cmd,
@@ -640,36 +712,111 @@ def rip_with_makemkv(
             text=True,
             bufsize=1,
         )
-        
+
         # Stream output line by line
         for line in process.stdout:
             line = line.rstrip()
             if line:
                 # Log makemkvcon output directly to show progress
                 logger.info(f"  {line}")
-        
+
         process.wait()
-        
+
         if process.returncode != 0:
             logger.error(f"MakeMKV failed with return code {process.returncode}")
             return None
-        
-        # Find the generated MKV file
+
+        # Find the generated MKV files
         mkv_files = list(Path(output_dir).glob("*.mkv"))
         if not mkv_files:
             logger.error("No MKV files found after rip")
             return None
-        
+
         # If multiple titles, pick the largest
         if use_largest_title and len(mkv_files) > 1:
             mkv_file = max(mkv_files, key=lambda p: p.stat().st_size)
             logger.info(f"Multiple titles found; selecting largest: {mkv_file.name}")
         else:
-            mkv_file = mkv_files[0]
-        
-        logger.info(f"✓ MakeMKV complete: {mkv_file}")
+            # For single title, find the largest (it's usually the main feature)
+            if len(mkv_files) > 1:
+                mkv_file = max(mkv_files, key=lambda p: p.stat().st_size)
+                logger.info(f"Multiple MKVs found; selecting largest: {mkv_file.name}")
+            else:
+                mkv_file = mkv_files[0]
+
+        logger.info(f"MakeMKV complete: {mkv_file}")
         return mkv_file
-        
+
+    except subprocess.TimeoutExpired:
+        logger.error("MakeMKV timed out (>1 hour)")
+        return None
+    except Exception as e:
+        logger.error(f"MakeMKV error: {e}")
+        return None
+
+
+def rip_title_with_makemkv(
+    device: str,
+    title_id: str,
+    output_dir: str,
+    min_duration: int,
+    logger: logging.Logger,
+) -> Optional[Path]:
+    """
+    Rip a specific title from BluRay to MKV using makemkvcon.
+    Unlike rip_with_makemkv(), this rips only the specified title_id.
+
+    Args:
+        device: BluRay device path
+        title_id: Specific title number to rip (as string)
+        output_dir: Output directory for the MKV file
+        min_duration: Minimum duration in seconds
+        logger: Logger instance
+
+    Returns:
+        Path to the output MKV, or None if failed
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    try:
+        # makemkvcon dev:<device> <title_id> <output_dir>
+        cmd = [
+            "makemkvcon",
+            "--minlength=" + str(min_duration),
+            "mkv",
+            "dev:" + device,
+            title_id,
+            output_dir,
+        ]
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        # Stream output line by line (show all MakeMKV progress)
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                logger.info(f"  {line}")
+
+        process.wait()
+
+        if process.returncode != 0:
+            logger.error(f"MakeMKV failed with return code {process.returncode}")
+            return None
+
+        mkv_files = list(Path(output_dir).glob("*.mkv"))
+        if not mkv_files:
+            logger.error(f"No MKV files found after rip for title {title_id}")
+            return None
+
+        mkv_file = max(mkv_files, key=lambda p: p.stat().st_size)
+        logger.info(f"MKV complete")
+        return mkv_file
+
     except subprocess.TimeoutExpired:
         logger.error("MakeMKV timed out (>1 hour)")
         return None
@@ -737,8 +884,6 @@ def get_available_handbrake_encoders(logger: logging.Logger) -> Dict[str, bool]:
                 if line.startswith('   ') and line_stripped:
                     available_encoders.add(line_stripped)
 
-        logger.debug(f"Found encoders: {available_encoders}")
-
         # Map to our encoder categories (using actual HandBrakeCLI names)
         encoders = {
             'nvenc_h265': 'nvenc_h265' in available_encoders,
@@ -746,10 +891,6 @@ def get_available_handbrake_encoders(logger: logging.Logger) -> Dict[str, bool]:
             'x265': 'x265' in available_encoders,
             'x264': 'x264' in available_encoders,
         }
-
-        for enc, available in encoders.items():
-            status = "available" if available else "unavailable"
-            logger.debug(f"HandBrake encoder {enc}: {status}")
 
         return encoders
     except Exception as e:
@@ -794,122 +935,68 @@ def encode_with_handbrake(
             "-Z", handbrake_config["preset"],
             "-f", handbrake_config["format"],
         ]
-        
-        # Video codec: default to nvenc_h265 if available, otherwise fall back through options
+
         selected_encoder = None
         if encoders.get('nvenc_h265'):
-            # NVIDIA NVENC H.265 (HEVC) encoder - preferred default
             selected_encoder = "nvenc_h265"
-            logger.info("✓ Using NVIDIA NVENC H.265 encoder")
+            logger.info("Using NVENC H.265")
         elif encoders.get('nvenc_h264'):
-            # NVIDIA NVENC H.264 encoder
             selected_encoder = "nvenc_h264"
-            logger.info("⚠ nvenc_h265 not available; using NVIDIA NVENC H.264 encoder")
-        elif encoders.get('x265'):
-            # CPU H.265 (HEVC) encoder
-            selected_encoder = "x265"
-            logger.info("⚠ No NVENC available; using CPU H.265 encoder")
-        elif encoders.get('x264'):
-            # CPU H.264 encoder
-            selected_encoder = "x264"
-            logger.info("⚠ Using CPU H.264 encoder")
+            logger.info("Using NVENC H.264")
         else:
-            # Ultimate fallback
-            selected_encoder = "x264"
-            logger.warning("⚠ No encoders detected; defaulting to x264")
-        
+            selected_encoder = "x265" if encoders.get('x265') else "x264"
+
         cmd.extend(["-e", selected_encoder])
-        
-        # Quality: CRF for CPU, NVIDIA uses different quality scale
+
         if 'nvenc' in selected_encoder:
-            # NVIDIA NVENC uses 0-51 quality scale (51=lowest quality, 0=highest)
-            # Map CRF 22 (CPU) to roughly NVIDIA quality 25 (similar perception)
             nvidia_quality = max(0, min(51, handbrake_config["quality"] + 3))
             cmd.extend(["-q", str(nvidia_quality)])
         else:
             cmd.extend(["-q", str(handbrake_config["quality"])])
-        
-        # Audio: include ALL audio tracks from source
-        # --all-audio: include every audio track found
-        # -E: audio encoder for all tracks
-        # -B: bitrate for all tracks
+
         cmd.extend([
             "--all-audio",
-            "-E", handbrake_config["audio_codec"],  # Audio encoder (aac)
-            "-B", handbrake_config["audio_bitrate"],  # Audio bitrate
+            "-E", handbrake_config["audio_codec"],
+            "-B", handbrake_config["audio_bitrate"],
         ])
 
-        # No subtitles - skip subtitle processing entirely
-        
-        logger.debug(f"Running: {' '.join(cmd)}")
-        
-        # Run with real-time progress streaming
-        # HandBrake outputs progress to stderr
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
         )
-        
-        # Stream stderr (progress) and stdout
-        import select
-        while True:
-            # Check both stdout and stderr for output
-            ready = select.select([process.stdout, process.stderr], [], [], 0.1)
-            
-            for stream in ready[0]:
-                line = stream.readline()
-                if line:
-                    line = line.rstrip()
-                    if line:
-                        # Log HandBrake output to show progress
-                        if "Encoding:" in line or "%" in line or "fps" in line:
-                            # Progress lines - log at INFO
-                            logger.info(f"  {line}")
-                        else:
-                            # Other output - log at DEBUG
-                            logger.debug(f"  {line}")
-            
-            # Check if process is done
-            if process.poll() is not None:
+
+        # Stream progress - show all HandBrake output (can take a while)
+        for line in iter(process.stdout.readline, ''):
+            if not line:
                 break
-        
-        # Get any remaining output
-        remaining_out = process.stdout.read()
-        remaining_err = process.stderr.read()
-        if remaining_out:
-            logger.info(f"  {remaining_out.rstrip()}")
-        if remaining_err:
-            logger.info(f"  {remaining_err.rstrip()}")
-        
+            line = line.rstrip()
+            logger.info(f"  {line}")
+
+        process.wait()
+
         if process.returncode != 0:
             logger.error(f"HandBrake failed with return code {process.returncode}")
             return False
-        
-        # Verify output file exists and has content
-        logger.info("Verifying encoded file...")
+
+        # Verify output file exists
         try:
-            result = subprocess.run(
-                ["stat", str(output_file)],
+            stat_output = subprocess.run(
+                ["stat", "--format=%s", str(output_file)],
                 capture_output=True,
                 text=True,
                 timeout=5,
             )
-            if result.returncode == 0:
-                # Extract file size from stat output
-                stat_output = result.stdout
-                logger.info(f"✓ Output file verified: {output_file}")
-                logger.info(f"  {stat_output.split(chr(10))[0]}")  # First line of stat
+            if stat_output.returncode == 0 and stat_output.stdout.strip():
+                logger.info(f"Encoding complete")
                 return True
-            else:
-                logger.error(f"Output file not found or inaccessible: {output_file}")
-                return False
-        except Exception as e:
-            logger.error(f"Failed to verify output file: {e}")
-            return False
-        
+        except Exception:
+            pass
+
+        logger.error(f"Output file not found or inaccessible: {output_file}")
+        return False
+
     except subprocess.TimeoutExpired:
         logger.error("HandBrake timed out (>4 hours)")
         return False
@@ -956,8 +1043,8 @@ EXAMPLES:
   # Dry-run to test device detection and metadata
   python rip.py --dry-run
 
-  # Rip a TV show (auto-detects from disk content)
-  python rip.py --output ~/Media/Plex/TV Shows
+  # Override detected type (movie or tv)
+  python rip.py --type tv
 
         """,
     )
@@ -1003,8 +1090,18 @@ EXAMPLES:
         action="store_true",
         help="Disable GPU acceleration (force CPU encoding)",
     )
+    parser.add_argument(
+        "--type",
+        choices=["movie", "tv"],
+        dest="media_type",
+        help="Override media type detection (movie or tv)",
+    )
 
     args = parser.parse_args()
+
+    # Ensure scratch_dir is a Path object for consistent handling
+    if not isinstance(args.scratch_dir, Path):
+        args.scratch_dir = Path(args.scratch_dir)
 
     # Apply CLI overrides to loaded config
     if args.no_gpu:
@@ -1012,22 +1109,16 @@ EXAMPLES:
 
     # Setup
     logger = setup_logging(args.log_level, config["log_file"])
-    logger.info("=" * 80)
-    logger.info("BluRay Ripper Started")
-    logger.info(f"Device: {args.device}")
-    logger.info(f"Output: {args.output_root}")
-    logger.info(f"Scratch: {args.scratch_dir}")
-    
+
     # Check GPU capability
     if config["handbrake"].get("use_gpu"):
-        logger.info("\n[GPU Acceleration]")
         if detect_nvidia_gpu(logger):
-            logger.info("✓ NVIDIA GPU available; will use NVENC for encoding")
+            logger.info("NVENC available")
         else:
-            logger.warning("✗ NVIDIA GPU not detected; will use CPU encoding")
-    
+            logger.warning("GPU not found; using CPU")
+
     # Step 1: Detect disk
-    logger.info("\n[1/5] Detecting BluRay disk...")
+    logger.info("[1/5] Detecting disk...")
     if not detect_bluray_disk(args.device, logger):
         logger.error(f"No disk detected at {args.device}")
         sys.exit(1)
@@ -1035,93 +1126,195 @@ EXAMPLES:
     
     # Step 2: Get metadata
     logger.info("\n[2/5] Fetching metadata...")
-    
+
     # Try to extract title directly from disk first
     disk_title = extract_bluray_title_from_disk(args.device, logger)
-    
+
     if disk_title:
         title = disk_title
-        logger.info(f"Using title from disk: {title}")
     else:
         # Fallback: prompt user
         title = prompt_for_title()
-    
-    # Look up metadata on OMDb
-    media_info = fetch_omdb_data(title, config["omdb_api_key"], logger)
-    if media_info:
-        logger.info(f"✓ Found: {media_info.plex_folder_name()}")
-        logger.info(f"  Rating: {media_info.rating}, Plot: {media_info.plot[:100]}...")
+
+    video_count = count_video_files_on_disk(args.device, logger)
+
+    # Extract year from title if present (e.g., "Knuckles 2023" -> year=2023)
+    year_match = re.search(r'\b(19|20)\d{2}\b', title)
+    title_year = int(year_match.group(0)) if year_match else 0
+
+    # Detect TV vs Movie based on video file count
+    is_tv_show_by_count = (video_count > 5)
+
+    if is_tv_show_by_count:
+        logger.info(f"Detected TV show: {video_count} video files found")
+        # Query OMDb for TV series first, then fall back to movie
+        media_info = fetch_omdb_data_for_tv(title, config["omdb_api_key"], logger, year=title_year)
+        if not media_info:
+            media_info = fetch_omdb_data(title, config["omdb_api_key"], logger, year=title_year)
     else:
-        logger.warning("✗ Metadata lookup failed; using title as-is")
+        # Query OMDb for movie first, then fall back to TV
+        media_info = fetch_omdb_data(title, config["omdb_api_key"], logger, year=title_year)
+        if not media_info:
+            media_info = fetch_omdb_data_for_tv(title, config["omdb_api_key"], logger, year=title_year)
+
+    if media_info:
+        # If we extracted a year and OMDb returned something different, trust our extraction
+        # This prevents wrong matches like "Knuckles (2023)" when it's actually 2024
+        if title_year > 0 and title_year != media_info.year:
+            logger.warning(f"OMDb returned {media_info.year} but title suggests {title_year}; using extracted year")
+
+        # Always prefer the disk-extracted year over OMDb's year for folder naming
+        if title_year > 0:
+            media_info.year = title_year
+
+        title = media_info.title  # Use corrected name from OMDb
+
+        # Print matched metadata for confirmation
+        logger.info(f"Matched: {media_info.title} ({media_info.year}) - Type: {media_info.imdb_id}")
+    else:
+        logger.warning("Metadata lookup failed; using title as-is")
         media_info = MediaInfo(title=title, year=0, imdb_id="", plot="", rating="")
-    
+
     # Dry-run: stop after metadata fetch
     if args.dry_run:
         logger.info("\n(Dry-run mode; stopping here)")
-        logger.info(f"Would rip to: {Path(args.output_root) / media_info.plex_folder_name()}")
+        # Show both potential outputs based on type detection
+        movie_output = Path(args.output_root) / media_info.plex_folder_name()
+        tv_root = config.get("output_root_tv_shows", os.path.expanduser(config["output_root"]))
+        tv_title_name = re.sub(r'\s*[Ss]eason\s*\d+', '', title).strip() if video_count > 10 else media_info.title
+        tv_output = Path(tv_root) / f"{tv_title_name}.tv"
+        logger.info(f"Movie output: {movie_output}")
+        logger.info(f"TV show output (based on {video_count} video files): {tv_output}")
+        # Show detection info
+        logger.info(f"Title from disk: {title}")
+        logger.info(f"Detected year: {media_info.year}")
+        if video_count >= 0:
+            logger.info(f"Video files on disk: {video_count}")
         sys.exit(0)
     
-    # Step 3: Rip with MakeMKV
-    logger.info("\n[3/5] Ripping with MakeMKV...")
-    mkv_path = rip_with_makemkv(
-        args.device,
-        args.scratch_dir,
-        config["makemkv"]["use_largest_title"],
-        config["makemkv"]["min_duration_seconds"],
-        logger,
-    )
-    if not mkv_path:
-        logger.error("MakeMKV rip failed")
-        sys.exit(1)
-    logger.info(f"✓ MKV ready: {mkv_path}")
-
-    # Step 4: Auto-detect TV show vs movie and encode with HandBrake
-    logger.info("\n[4/5] Detecting content type and encoding...")
-
-    # Get title list from the rip to detect content type
+    # Step 3: Get title list first to detect content type
+    logger.info("Scanning titles...")
     titles = get_makemkv_title_list(args.device, config["makemkv"]["min_duration_seconds"], logger)
 
-    # Detect if this is a TV show or movie
-    is_tv_show, tv_title_name = detect_tv_show_vs_movie(titles, logger)
+    if not titles:
+        logger.error("No titles found on disc")
+        sys.exit(1)
+    logger.info(f"Found {len(titles)} title(s)")
+
+    # Use user override or auto-detect
+    if args.media_type:
+        is_tv_show = (args.media_type == "tv")
+        logger.info(f"--type={args.media_type} override")
+    else:
+        is_tv_show, tv_title_name = detect_tv_show_vs_movie(titles, title, media_info.year if media_info else 0, video_count, logger)
+
+    # Step 4: Rip based on content type
+    logger.info("Ripping content...")
 
     if is_tv_show:
-        logger.info(f"✓ Detected as TV show: {tv_title_name}")
-
         # Determine output path for TV shows (Plex structure)
         tv_root = config.get("output_root_tv_shows", os.path.expanduser(config["output_root"]))
+        year_str = f" ({media_info.year})" if media_info and media_info.year else ""
+        season_folder_format = "Season {:02d}"
 
-        # For TV shows, use a simple structure without year
-        output_path = Path(tv_root) / f"{tv_title_name}.tv"
+        logger.info(f"[TV] {len(titles)} episodes")
 
-        logger.info(f"  Output (TV): {output_path}")
+        for i, title_info in enumerate(titles):
+            episode_num = i + 1
+            title_id = title_info.title_id
 
-        if not encode_with_handbrake(mkv_path, output_path, config["handbrake"], logger):
-            logger.error("HandBrake encoding failed")
-            sys.exit(1)
+            # Parse season/episode from title name (e.g., "S01E01", "Episode 01")
+            season_match = re.search(r'[Ss](\d+)[Ee](\d+)', title_info.name)
+            if season_match:
+                season_num = int(season_match.group(1))
+                ep_num = int(season_match.group(2))
+            else:
+                # Fall back to sequential numbering
+                season_num = 1
+                ep_num = episode_num
+
+            # Extract clean episode name
+            clean_name = re.sub(r'[Ss]\d+[Ee]\d+\s*', '', title_info.name).strip()
+            if not clean_name:
+                clean_name = f"Episode {ep_num:02d}"
+
+            logger.info(f"Episode S{season_num:02d}E{ep_num:02d}: {title_info.name} (ID:{title_id})")
+
+            # Create season folder path
+            season_folder = Path(tv_root) / f"{tv_title_name}{year_str}" / season_folder_format.format(season_num)
+            season_folder.mkdir(parents=True, exist_ok=True)
+
+            # Output filename (Plex episode naming: ShowName-S##E##.mkv)
+            output_filename = f"{tv_title_name.replace(' ', '')}S{season_num:02d}E{ep_num:02d}.mkv"
+            output_path = season_folder / output_filename
+
+            # Create temp dir for this episode's MKV (cleanup any leftover files first)
+            temp_mkv_dir = Path(args.scratch_dir) / f"episode_{episode_num}"
+            if temp_mkv_dir.exists():
+                import shutil
+                shutil.rmtree(temp_mkv_dir)
+            temp_mkv_dir.mkdir(parents=True, exist_ok=True)
+
+            # Step 3b: Rip individual title with MakeMKV
+            mkv_path = rip_title_with_makemkv(
+                args.device,
+                str(title_id),
+                str(temp_mkv_dir),
+                config["makemkv"]["min_duration_seconds"],
+                logger,
+            )
+            if not mkv_path:
+                logger.error(f"MakeMKV rip failed for episode {title_id}")
+                sys.exit(1)
+            logger.info(f"✓ MKV ready: {mkv_path}")
+
+            # Step 4b: Encode with HandBrake
+            if not encode_with_handbrake(mkv_path, output_path, config["handbrake"], logger):
+                logger.error("HandBrake encoding failed")
+                sys.exit(1)
+            logger.info(f"✓ Encoding complete: {output_path}")
+
+            # Cleanup temp MKV for this episode
+            try:
+                mkv_path.unlink()
+            except Exception:
+                pass
+
+        logger.info("Done")
     else:
-        # Movie handling (original logic)
+        # Movie handling - rip all titles with MakeMKV
+        mkv_path = rip_with_makemkv(
+            args.device,
+            args.scratch_dir,
+            config["makemkv"]["use_largest_title"],
+            config["makemkv"]["min_duration_seconds"],
+            logger,
+        )
+        if not mkv_path:
+            logger.error("MakeMKV rip failed")
+            sys.exit(1)
+
         folder_name = media_info.plex_folder_name() if media_info else "Unknown Title"
         output_path = Path(args.output_root) / folder_name / f"{folder_name}.mkv"
 
-        logger.info(f"  Output (Movie): {output_path}")
-
+        # Step 5: Encode with HandBrake
         if not encode_with_handbrake(mkv_path, output_path, config["handbrake"], logger):
             logger.error("HandBrake encoding failed")
             sys.exit(1)
-    logger.info(f"✓ Encoding complete: {output_path}")
-    
-    # Step 5: Cleanup
-    logger.info("\n[5/5] Cleanup...")
-    try:
-        mkv_path.unlink()
-        logger.info(f"✓ Removed temp MKV: {mkv_path}")
-    except Exception as e:
-        logger.warning(f"Failed to remove temp file: {e}")
-    
-    logger.info("\n" + "=" * 80)
-    logger.info("✓ Pipeline complete!")
-    logger.info(f"Movie saved to: {output_path}")
-    logger.info(f"Plex folder: {output_path.parent}")
+
+        # Step 6: Cleanup
+        try:
+            mkv_path.unlink()
+        except Exception:
+            pass
+
+    logger.info("=" * 40)
+    logger.info("Pipeline complete!")
+    if is_tv_show:
+        logger.info(f"TV show episodes saved to: {tv_root}/{tv_title_name}{year_str}/")
+    else:
+        logger.info(f"Movie saved to: {output_path}")
+        logger.info(f"Plex folder: {output_path.parent}")
 
 
 if __name__ == "__main__":
